@@ -1,0 +1,6 @@
+venv/
+.venv/
+*.db
+.chrome_profile/
+*.json
+dist
