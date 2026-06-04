@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QPlainTextEdit, QMessageBox, QDialog, QDialogButtonBox, QTextEdit,
     
-    QDateEdit, QTimeEdit, QGroupBox, QGridLayout
+    QDateEdit, QTimeEdit, QGroupBox, QGridLayout, QLineEdit, QTableWidget,
+    QTableWidgetItem, QAbstractItemView, QHeaderView
 )
 from PySide6.QtCore import Qt, Signal, QObject, Slot, QDate, QTime
 from PySide6.QtWidgets import QSizePolicy
@@ -154,6 +155,7 @@ class UILogger(QObject):
     enable_ui = Signal(bool)
     show_info = Signal(str, str)
     show_error = Signal(str, str)
+    friends_loaded = Signal()
     # (title, instructions, proceed_event, cancel_event, proceed_text)
     open_gate = Signal(str, str, object, object, str)
 
@@ -169,6 +171,39 @@ def clear_tables(include_messages: bool = True):
     conn.close()
 
 # ===================== スクレイピング処理（別スレッド） =====================
+def load_users_for_selection(db_path: str = "lstep_users.db") -> list[dict]:
+    """UIの友だち選択リストに表示する users データを読み込む。"""
+    try:
+        initialize_db()
+    except sqlite3.Error:
+        return []
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, line_name, display_name, new_message_date, support, tags
+            FROM users
+            ORDER BY id ASC
+            """
+        )
+        return [
+            {
+                "id": row[0],
+                "line_name": row[1] or "",
+                "display_name": row[2] or "",
+                "new_message_date": row[3] or "",
+                "support": row[4] or "",
+                "tags": row[5] or "",
+            }
+            for row in cur.fetchall()
+        ]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
 def run_scraping(logger: UILogger, target_date: str | None = None):
     driver = None
     try:
@@ -209,6 +244,75 @@ def run_scraping(logger: UILogger, target_date: str | None = None):
     except Exception as e:
         logger.message.emit(f"❌ エラー: {e}")
         logger.show_error.emit("エラー", f"{e}")
+    finally:
+        try:
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+        logger.enable_ui.emit(True)
+
+def run_friend_list_scraping(logger: UILogger):
+    driver = None
+    try:
+        logger.enable_ui.emit(False)
+        logger.message.emit("🟡 友だちリスト取得の初期化中…")
+        initialize_db()
+
+        logger.message.emit("🟡 ブラウザを起動します…")
+        options = create_chrome_options()
+        driver = webdriver.Chrome(options=options)
+        logger.message.emit("🟡 自動ログインセッションで友だちリストへ移動します…")
+        driver.get("https://step.lme.jp/basic/friendlist")
+
+        logger.message.emit("🟡 友だち一覧を取得中…")
+        time.sleep(8)
+        scrape_user_list(driver)
+        logger.message.emit("✅ 友だちリスト取得が完了しました。")
+        logger.friends_loaded.emit()
+    except Exception as e:
+        logger.message.emit(f"❌ 友だちリスト取得エラー: {e}")
+        logger.show_error.emit("友だちリスト取得エラー", f"{e}")
+    finally:
+        try:
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+        logger.enable_ui.emit(True)
+
+
+def run_selected_friend_message_scraping(
+    logger: UILogger,
+    selected_user_ids: list[int],
+    target_date: str | None = None,
+):
+    driver = None
+    try:
+        logger.enable_ui.emit(False)
+        initialize_db()
+        initialize_message_table()
+
+        logger.message.emit(f"🟡 選択友だち {len(selected_user_ids)}件のメッセージ取得を開始します…")
+        if target_date:
+            logger.message.emit(f"📅 対象日: {target_date}")
+        else:
+            logger.message.emit("📅 対象日指定なし: 全期間を取得します")
+
+        options = create_chrome_options()
+        driver = webdriver.Chrome(options=options)
+        driver.get("https://step.lme.jp/")
+        scrape_messages(
+            driver,
+            logger,
+            target_date=target_date,
+            user_ids=selected_user_ids,
+            use_resume=False,
+        )
+        logger.message.emit("🎉 選択友だちのメッセージ取得が完了しました！")
+    except Exception as e:
+        logger.message.emit(f"❌ 選択友だちメッセージ取得エラー: {e}")
+        logger.show_error.emit("選択友だちメッセージ取得エラー", f"{e}")
     finally:
         try:
             if driver:
@@ -359,11 +463,13 @@ class MainWindow(QWidget):
         self.analysis_window = None   # ← GC対策で保持
         self.logger.show_info.connect(self.on_show_info)
         self.logger.show_error.connect(self.on_show_error)
+        self.logger.friends_loaded.connect(self.load_friends_from_db)
         self.logger.open_gate.connect(self.on_open_gate)
         self.polling_stop_event = None
         self.polling_thread = None
         self.polling_active = False
         self._build()
+        self.load_friends_from_db()
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -385,7 +491,7 @@ class MainWindow(QWidget):
         # カード：操作ボタン（左）
         actions_card = QFrame()
         actions_card.setObjectName("Card")
-        actions_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        actions_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         actions = QVBoxLayout(actions_card)
         actions.setSpacing(14)
         run_group = QGroupBox("データ取得")
@@ -393,9 +499,13 @@ class MainWindow(QWidget):
 
         run_grid = QGridLayout(run_group)
 
-        self.btn_scrape = QPushButton("スクレイピング実行")
+        self.btn_friend_list_scrape = QPushButton("友だちリスト取得")
+        self.btn_friend_list_scrape.clicked.connect(self.on_click_friend_list_scrape)
+        run_grid.addWidget(self.btn_friend_list_scrape, 0, 0, 1, 2)
+
+        self.btn_scrape = QPushButton("スクレイピング実行（全友だち）")
         self.btn_scrape.clicked.connect(self.on_click_scrape)
-        run_grid.addWidget(self.btn_scrape, 0, 0, 1, 2)
+        run_grid.addWidget(self.btn_scrape, 1, 0, 1, 2)
 
         self.date_input = QDateEdit()
         self.date_input.setDisplayFormat("yyyy-MM-dd")
@@ -404,16 +514,16 @@ class MainWindow(QWidget):
         self.date_input.setMinimumDate(QDate(2000, 1, 1))
         self.date_input.setDate(self.date_input.minimumDate())
         self.date_input.setToolTip("対象日を指定すると、その日のメッセージのみ取得します。未指定なら全期間を取得します。")
-        run_grid.addWidget(QLabel("対象日"), 1, 0)
-        run_grid.addWidget(self.date_input, 1, 1)
+        run_grid.addWidget(QLabel("対象日"), 2, 0)
+        run_grid.addWidget(self.date_input, 2, 1)
 
         self.btn_tag_scrape = QPushButton("タグ取得実行")
         self.btn_tag_scrape.clicked.connect(self.on_click_tag_scrape)
-        run_grid.addWidget(self.btn_tag_scrape, 2, 0, 1, 2)
+        run_grid.addWidget(self.btn_tag_scrape, 3, 0, 1, 2)
 
         self.btn_login_save = QPushButton("ログイン保存実行")
         self.btn_login_save.clicked.connect(self.on_click_login_save)
-        run_grid.addWidget(self.btn_login_save, 3, 0, 1, 2)
+        run_grid.addWidget(self.btn_login_save, 4, 0, 1, 2)
 
         polling_group = QGroupBox("ポーリング")
         polling_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
@@ -463,7 +573,47 @@ class MainWindow(QWidget):
         self.btn_export.clicked.connect(self.on_click_export)
         export_row.addWidget(self.btn_export)
 
+        friend_group = QGroupBox("友だち選択")
+        friend_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        friend_layout = QVBoxLayout(friend_group)
+
+        self.friend_search_input = QLineEdit()
+        self.friend_search_input.setPlaceholderText("LINE名・表示名・担当者・タグで検索")
+        self.friend_search_input.textChanged.connect(self.filter_friend_table)
+        friend_layout.addWidget(self.friend_search_input)
+
+        self.friend_table = QTableWidget(0, 6)
+        self.friend_table.setHorizontalHeaderLabels(["ID", "LINE名", "表示名", "新規メッセージ日", "担当者", "タグ"])
+        self.friend_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.friend_table.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.friend_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.friend_table.verticalHeader().setVisible(False)
+        self.friend_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.friend_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.friend_table.setMinimumHeight(260)
+        friend_layout.addWidget(self.friend_table)
+
+        friend_buttons = QHBoxLayout()
+        self.btn_reload_friends = QPushButton("一覧再読み込み")
+        self.btn_reload_friends.setObjectName("SecondaryButton")
+        self.btn_reload_friends.clicked.connect(self.load_friends_from_db)
+        friend_buttons.addWidget(self.btn_reload_friends)
+        self.btn_select_all_friends = QPushButton("表示中を全選択")
+        self.btn_select_all_friends.setObjectName("SecondaryButton")
+        self.btn_select_all_friends.clicked.connect(self.select_visible_friends)
+        friend_buttons.addWidget(self.btn_select_all_friends)
+        self.btn_clear_friend_selection = QPushButton("選択解除")
+        self.btn_clear_friend_selection.setObjectName("SecondaryButton")
+        self.btn_clear_friend_selection.clicked.connect(self.friend_table.clearSelection)
+        friend_buttons.addWidget(self.btn_clear_friend_selection)
+        friend_layout.addLayout(friend_buttons)
+
+        self.btn_selected_friend_messages = QPushButton("選択した友だちのやり取りを取得")
+        self.btn_selected_friend_messages.clicked.connect(self.on_click_selected_friend_messages)
+        friend_layout.addWidget(self.btn_selected_friend_messages)
+
         actions.addWidget(run_group)
+        actions.addWidget(friend_group)
         actions.addWidget(polling_group)
         actions.addWidget(maintenance_group)
         actions.addWidget(export_group)
@@ -485,6 +635,60 @@ class MainWindow(QWidget):
         apply_card_shadow(log_card)  # ← カードに影
 
         root.addLayout(body, 1)
+    def _selected_date_text(self):
+        if self.date_input.date() != self.date_input.minimumDate():
+            return self.date_input.date().toString("yyyy-MM-dd")
+        return None
+
+    @Slot()
+    def load_friends_from_db(self):
+        users = load_users_for_selection()
+        self.friend_table.setRowCount(0)
+        for user in users:
+            row = self.friend_table.rowCount()
+            self.friend_table.insertRow(row)
+            values = [
+                user["id"],
+                user["line_name"],
+                user["display_name"],
+                user["new_message_date"],
+                user["support"],
+                user["tags"],
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if col == 0:
+                    item.setData(Qt.UserRole, int(user["id"]))
+                self.friend_table.setItem(row, col, item)
+        self.filter_friend_table(self.friend_search_input.text())
+        self.logger.message.emit(f"👥 友だち一覧を読み込みました: {len(users)}件")
+
+    @Slot(str)
+    def filter_friend_table(self, text: str):
+        keyword = (text or "").strip().lower()
+        for row in range(self.friend_table.rowCount()):
+            searchable = []
+            for col in range(1, self.friend_table.columnCount()):
+                item = self.friend_table.item(row, col)
+                searchable.append(item.text().lower() if item else "")
+            self.friend_table.setRowHidden(row, bool(keyword) and keyword not in " ".join(searchable))
+
+    def select_visible_friends(self):
+        self.friend_table.clearSelection()
+        for row in range(self.friend_table.rowCount()):
+            if not self.friend_table.isRowHidden(row):
+                self.friend_table.selectRow(row)
+
+    def get_selected_friend_ids(self) -> list[int]:
+        selected_ids = set()
+        for index in self.friend_table.selectionModel().selectedRows():
+            if self.friend_table.isRowHidden(index.row()):
+                continue
+            item = self.friend_table.item(index.row(), 0)
+            if item:
+                selected_ids.add(int(item.data(Qt.UserRole) or item.text()))
+        return sorted(selected_ids)
+    
     def run_upload(self):
         try:
             self.logger.enable_ui.emit(False)
@@ -514,12 +718,19 @@ class MainWindow(QWidget):
             self.logger.enable_ui.emit(True)
     # ---------- UI slots ----------
     def set_controls_enabled(self, enabled: bool):
+        self.btn_friend_list_scrape.setEnabled(enabled)
         self.btn_scrape.setEnabled(enabled)
         self.btn_tag_scrape.setEnabled(enabled)
         self.btn_upload.setEnabled(enabled)
         self.btn_login_save.setEnabled(enabled)
         # self.btn_analysis.setEnabled(enabled)
         self.btn_export.setEnabled(enabled)   # ← 追加
+        self.btn_reload_friends.setEnabled(enabled)
+        self.btn_select_all_friends.setEnabled(enabled)
+        self.btn_clear_friend_selection.setEnabled(enabled)
+        self.btn_selected_friend_messages.setEnabled(enabled)
+        self.friend_search_input.setEnabled(enabled)
+        self.friend_table.setEnabled(enabled)
         self.date_input.setEnabled(enabled)
         self.polling_time_input.setEnabled(enabled and not self.polling_active)
         self.btn_polling_start.setEnabled(enabled and not self.polling_active)
@@ -577,11 +788,26 @@ class MainWindow(QWidget):
             self.set_controls_enabled(True)  # 念のため即座にUIを戻す
 
     # ---------- Actions ----------
+    def on_click_friend_list_scrape(self):
+        t = threading.Thread(target=run_friend_list_scraping, args=(self.logger,), daemon=True)
+        t.start()
     def on_click_scrape(self):
-        selected_date = None
-        if self.date_input.date() != self.date_input.minimumDate():
-            selected_date = self.date_input.date().toString("yyyy-MM-dd")
+        selected_date = self._selected_date_text()
         t = threading.Thread(target=run_scraping, args=(self.logger, selected_date), daemon=True)
+        t.start()
+
+    def on_click_selected_friend_messages(self):
+        selected_user_ids = self.get_selected_friend_ids()
+        if not selected_user_ids:
+            self.logger.message.emit("⚠️ メッセージ取得対象の友だちを選択してください。")
+            self.logger.show_error.emit("友だち未選択", "メッセージ取得対象の友だちを1人以上選択してください。")
+            return
+        selected_date = self._selected_date_text()
+        t = threading.Thread(
+            target=run_selected_friend_message_scraping,
+            args=(self.logger, selected_user_ids, selected_date),
+            daemon=True,
+        )
         t.start()
 
     def on_click_polling_start(self):

@@ -470,12 +470,19 @@ def normalize_new_message_date(raw: str | None) -> str | None:
 
     return None
 # 各ユーザーのチャット履歴を取得
-def scrape_messages(driver, logger, base_url="https://step.lme.jp", target_date: str | None = None):
+def scrape_messages(
+    driver,
+    logger,
+    base_url="https://step.lme.jp",
+    target_date: str | None = None,
+    user_ids: list[int] | None = None,
+    use_resume: bool = True,
+):
 
 
     # 再開ポイント読込
     resume_from = 0
-    if os.path.exists(RESUME_FILE):
+    if use_resume and os.path.exists(RESUME_FILE):
         try:
             resume_from = int(open(RESUME_FILE).read().strip())
             print(f"🔁 再開モード: user_id {resume_from} 以降から処理します。")
@@ -484,10 +491,21 @@ def scrape_messages(driver, logger, base_url="https://step.lme.jp", target_date:
 
     conn = sqlite3.connect("lstep_users.db")
     cursor = conn.cursor()
-    cursor.execute('SELECT id, href, new_message_date FROM users ORDER BY id ASC')
+    if user_ids:
+        normalized_user_ids = sorted({int(user_id) for user_id in user_ids})
+        placeholders = ",".join("?" for _ in normalized_user_ids)
+        cursor.execute(
+            f"SELECT id, href, new_message_date FROM users WHERE id IN ({placeholders}) ORDER BY id ASC",
+            normalized_user_ids,
+        )
+    else:
+        normalized_user_ids = None
+        cursor.execute('SELECT id, href, new_message_date FROM users ORDER BY id ASC')
     users = cursor.fetchall()
     conn.close()
 
+    if normalized_user_ids is not None:
+        logger.message.emit(f"👥 選択友だちのみ取得します: {len(users)}件")
 
     if target_date:
         logger.message.emit(f"📅 対象日のみ取得します: {target_date} (JST)")
@@ -657,9 +675,10 @@ def scrape_messages(driver, logger, base_url="https://step.lme.jp", target_date:
             save_message(user_id, sender, name_to_save, text, time_sent)
 
         # 再開ポイント更新
-        with open(RESUME_FILE, "w") as f:
-            f.write(str(user_id))
+        if use_resume:
+            with open(RESUME_FILE, "w") as f:
+                f.write(str(user_id))
 
     print("🎉 全メッセージ取得が完了しました！")
-    if os.path.exists(RESUME_FILE):
+    if use_resume and os.path.exists(RESUME_FILE):
         os.remove(RESUME_FILE)
