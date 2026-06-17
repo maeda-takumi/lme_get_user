@@ -5,6 +5,10 @@ import socket
 import time
 
 DEFAULT_HOSTS = ["sv1108.star.ne.jp", "ss911157.stars.ne.jp"]
+# totalappworks.com は Cloudflare 配下の公開Webドメインのため、
+# FTP/FTPS の接続先として使うと Cloudflare のIPへ接続してタイムアウトする。
+# スターサーバーのFTPSホストへ正規化して接続する。
+HOST_ALIASES = {"totalappworks.com": "ss911157.stars.ne.jp"}
 DEFAULT_PORT = 21
 
 def _pwd(ftps: FTP_TLS) -> str:
@@ -86,7 +90,13 @@ def upload_db_ftps(
     """
     戻り値: デバッグ情報を辞書で返す（UIログにも表示可）
     """
-    hosts = hosts or DEFAULT_HOSTS
+    original_hosts = hosts or DEFAULT_HOSTS
+    hosts = [HOST_ALIASES.get(host, host) for host in original_hosts]
+    host_aliases = {
+        normalized: original
+        for original, normalized in zip(original_hosts, hosts)
+        if original != normalized
+    }
     lf = Path(local_file)
     if not lf.exists():
         raise FileNotFoundError(f"ローカルに {local_file} が見つかりません。")
@@ -94,12 +104,11 @@ def upload_db_ftps(
     debug = {"trials": []}
     last_err = None
 
-    # ユーザー名候補（@host 付きも試す）
-    user_candidates = [user]
-    if "@" not in user:
-        user_candidates.append(f"{user}@{hosts[0]}")
-
     for host in hosts:
+        # ユーザー名候補（@host 付きも試す）。ホストを正規化した後のFTPSホストを使う。
+        user_candidates = [user]
+        if "@" not in user:
+            user_candidates.append(f"{user}@{host}")
         try:
             ip = socket.gethostbyname(host)
         except Exception as e:
@@ -109,6 +118,9 @@ def upload_db_ftps(
 
         for u in user_candidates:
             trial = {"host": host, "ip": ip, "user": u}
+            if host in host_aliases:
+                trial["requested_host"] = host_aliases[host]
+                trial["host_note"] = "公開WebドメインではなくFTPSホストへ正規化しました"
             try:
                 ftps = FTP_TLS(timeout=timeout)
                 ftps.connect(host=host, port=port)
